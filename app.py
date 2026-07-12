@@ -518,6 +518,35 @@ def user_dashboard():
     if 'wizard_step' not in st.session_state:
         st.session_state.wizard_step = 1
 
+    # --- CUSTOM CSS FOR SLIDER COLORS ---
+    st.markdown("""
+        <style>
+        /* Green sliders for Strengths */
+        div[data-testid="stSlider"][data-slider-type="strength"] div[role="slider"] {
+            background-color: #28a745 !important;
+        }
+        div[data-testid="stSlider"][data-slider-type="strength"] .st-emotion-cache-1gulkj5 {
+            background: linear-gradient(to right, #d4edda 0%, #28a745 100%) !important;
+        }
+        
+        /* Red sliders for Weaknesses */
+        div[data-testid="stSlider"][data-slider-type="weakness"] div[role="slider"] {
+            background-color: #dc3545 !important;
+        }
+        div[data-testid="stSlider"][data-slider-type="weakness"] .st-emotion-cache-1gulkj5 {
+            background: linear-gradient(to right, #f8d7da 0%, #dc3545 100%) !important;
+        }
+        
+        /* Default green for impact sliders */
+        div[data-testid="stSlider"][data-slider-type="impact"] div[role="slider"] {
+            background-color: #007bff !important;
+        }
+        div[data-testid="stSlider"][data-slider-type="impact"] .st-emotion-cache-1gulkj5 {
+            background: linear-gradient(to right, #cce5ff 0%, #007bff 100%) !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
     # --- Step 1: Impact Scoring ---
     if st.session_state.wizard_step == 1:
         st.header("Step 1: Rate the Impact")
@@ -525,11 +554,46 @@ def user_dashboard():
 
         with st.form("impact_form"):
             impact_scores = {}
-            for _, row in df_factors.iterrows():
-                label = f"**{row['factor_id']}**: {row['factor_text']}"
-                impact_scores[row['factor_id']] = st.slider(label, 1, 9, 5, key=f"imp_{row['factor_id']}")
+            
+            # Separate strengths and weaknesses
+            strengths = df_factors[df_factors['type'].str.lower() == 'strength'].sort_values('factor_id')
+            weaknesses = df_factors[df_factors['type'].str.lower() == 'weakness'].sort_values('factor_id')
+            
+            if not strengths.empty:
+                st.markdown("### 💪 Strengths")
+                for _, row in strengths.iterrows():
+                    # Add green-colored container for visual consistency
+                    with st.container():
+                        st.markdown(
+                            f'<div style="padding:10px; border-left:4px solid #28a745; background-color:#f0fff0; margin-bottom:10px; border-radius:5px;">'
+                            f'<b>{row["factor_id"]}</b>: {row["factor_text"]}</div>',
+                            unsafe_allow_html=True
+                        )
+                        impact_scores[row['factor_id']] = st.slider(
+                            f"Impact rating for {row['factor_id']}",
+                            1, 9, 5,
+                            key=f"imp_strength_{row['factor_id']}",
+                            label_visibility="collapsed"
+                        )
+            
+            if not weaknesses.empty:
+                st.markdown("### ⚠️ Weaknesses")
+                for _, row in weaknesses.iterrows():
+                    # Add red-colored container for visual consistency
+                    with st.container():
+                        st.markdown(
+                            f'<div style="padding:10px; border-left:4px solid #dc3545; background-color:#fff5f5; margin-bottom:10px; border-radius:5px;">'
+                            f'<b>{row["factor_id"]}</b>: {row["factor_text"]}</div>',
+                            unsafe_allow_html=True
+                        )
+                        impact_scores[row['factor_id']] = st.slider(
+                            f"Impact rating for {row['factor_id']}",
+                            1, 9, 5,
+                            key=f"imp_weakness_{row['factor_id']}",
+                            label_visibility="collapsed"
+                        )
 
-            submitted = st.form_submit_button("Next: Rate Performance →")
+            submitted = st.form_submit_button("Next: Rate Performance →", use_container_width=True, type="primary")
             if submitted:
                 st.session_state['impact_scores'] = impact_scores
                 st.session_state.wizard_step = 2
@@ -542,20 +606,52 @@ def user_dashboard():
 
         with st.form("performance_form"):
             performance_scores = {}
-            for _, row in df_factors.iterrows():
-                label = f"**{row['factor_id']}**: {row['factor_text']}"
-                if row['type'].lower() == 'weakness':
-                    performance_scores[row['factor_id']] = st.slider(
-                        label, min_value=-9, max_value=-1, value=-5, key=f"perf_{row['factor_id']}"
-                    )
-                else:  # Strengths
-                    performance_scores[row['factor_id']] = st.slider(
-                        label, min_value=1, max_value=9, value=5, key=f"perf_{row['factor_id']}"
-                    )
+            
+            # Separate strengths and weaknesses
+            strengths = df_factors[df_factors['type'].str.lower() == 'strength'].sort_values('factor_id')
+            weaknesses = df_factors[df_factors['type'].str.lower() == 'weakness'].sort_values('factor_id')
+            
+            if not strengths.empty:
+                st.markdown("### 💪 Strengths")
+                st.caption("Rate how well each strength is currently performing (1 = Underperforming, 9 = Excellent)")
+                for _, row in strengths.iterrows():
+                    with st.container():
+                        st.markdown(
+                            f'<div style="padding:10px; border-left:4px solid #28a745; background-color:#f0fff0; margin-bottom:10px; border-radius:5px;">'
+                            f'<b>{row["factor_id"]}</b>: {row["factor_text"]}</div>',
+                            unsafe_allow_html=True
+                        )
+                        performance_scores[row['factor_id']] = st.slider(
+                            f"Performance rating for {row['factor_id']}",
+                            min_value=1,
+                            max_value=9,
+                            value=5,
+                            key=f"perf_strength_{row['factor_id']}",
+                            label_visibility="collapsed"
+                        )
+            
+            if not weaknesses.empty:
+                st.markdown("### ⚠️ Weaknesses")
+                st.caption("Rate the current severity of each weakness (-9 = Critical problem, -1 = Minor/managed issue)")
+                for _, row in weaknesses.iterrows():
+                    with st.container():
+                        st.markdown(
+                            f'<div style="padding:10px; border-left:4px solid #dc3545; background-color:#fff5f5; margin-bottom:10px; border-radius:5px;">'
+                            f'<b>{row["factor_id"]}</b>: {row["factor_text"]}</div>',
+                            unsafe_allow_html=True
+                        )
+                        performance_scores[row['factor_id']] = st.slider(
+                            f"Performance rating for {row['factor_id']}",
+                            min_value=-9,
+                            max_value=-1,
+                            value=-5,
+                            key=f"perf_weakness_{row['factor_id']}",
+                            label_visibility="collapsed"
+                        )
 
             col1, col2 = st.columns([1, 0.3])
             with col1:
-                submit_button = st.form_submit_button("✅ Submit All Scores", use_container_width=True)
+                submit_button = st.form_submit_button("✅ Submit All Scores", use_container_width=True, type="primary")
             with col2:
                 back_button = st.form_submit_button("← Back")
 
