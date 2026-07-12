@@ -12,6 +12,7 @@ st.set_page_config(
 )
 
 # --- DATABASE FUNCTIONS for NeonDB (PostgreSQL) ---
+# fixed paths
 
 def get_db_connection():
     """
