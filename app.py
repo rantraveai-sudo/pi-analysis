@@ -2,7 +2,8 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from scipy.stats import rankdata
-from sqlalchemy import text  # Important: Use for running raw SQL with st.connection
+from sqlalchemy import text
+import io
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
@@ -12,7 +13,6 @@ st.set_page_config(
 )
 
 # --- DATABASE FUNCTIONS for NeonDB (PostgreSQL) ---
-# fixed paths
 
 def get_db_connection():
     """
@@ -57,7 +57,6 @@ def init_db():
 def login(username, password):
     """
     Validates user credentials against the database.
-    NOTE: conn.query() is cached — never pass text() here, plain string only.
     """
     conn = get_db_connection()
     query = "SELECT * FROM users WHERE username = :user AND password = :pass"
@@ -83,6 +82,94 @@ def logout():
     st.rerun()
 
 
+# --- HELPER FUNCTION: CALCULATE INDIVIDUAL USER SCORES ---
+def calculate_user_scores(df_scores_raw, df_factors):
+    """
+    Calculate priority score and rank for each user individually.
+    Returns a dataframe with columns: username, factor_id, impact, performance, user_score, user_rank
+    """
+    results = []
+    
+    for username in df_scores_raw['username'].unique():
+        user_data = df_scores_raw[df_scores_raw['username'] == username].copy()
+        user_data = user_data.merge(df_factors[['factor_id', 'factor_text', 'type']], on='factor_id', how='left')
+        
+        # Calculate user's priority score for each factor
+        user_data['user_score'] = (0.75 * user_data['impact']) + (0.25 * user_data['performance'].abs())
+        
+        # Rank the user's scores (1 = highest priority)
+        user_data['user_rank'] = rankdata(-user_data['user_score'], method='min')
+        
+        results.append(user_data[['username', 'factor_id', 'impact', 'performance', 'user_score', 'user_rank']])
+    
+    if results:
+        return pd.concat(results, ignore_index=True)
+    else:
+        return pd.DataFrame()
+
+
+# --- HELPER FUNCTION: BUILD DETAILED CSV ---
+def build_detailed_csv(conn):
+    """
+    Builds a comprehensive CSV with:
+    - Serial No
+    - Factor_ID
+    - Factor_Text
+    - Type
+    - For each user: Impact, Performance, Score, Rank
+    - Mean_Score
+    - Auto_Final_Rank
+    - Admin_Final_Rank (from overrides)
+    """
+    # Get all data
+    df_factors = conn.query("SELECT * FROM factors ORDER BY factor_id", ttl=0)
+    df_scores_raw = conn.query("SELECT username, factor_id, impact, performance FROM scores", ttl=0)
+    df_overrides = conn.query("SELECT factor_id, override_rank FROM rank_overrides", ttl=0)
+    
+    if df_scores_raw.empty:
+        return None
+    
+    # Calculate individual user scores
+    user_scores = calculate_user_scores(df_scores_raw, df_factors)
+    
+    # Start building the final dataframe
+    result = df_factors[['factor_id', 'factor_text', 'type']].copy()
+    result.insert(0, 'Serial_No', range(1, len(result) + 1))
+    
+    # Add columns for each user
+    users = sorted(df_scores_raw['username'].unique())
+    
+    for user in users:
+        user_data = user_scores[user_scores['username'] == user]
+        user_dict = user_data.set_index('factor_id')[['impact', 'performance', 'user_score', 'user_rank']].to_dict('index')
+        
+        result[f'{user}_Impact'] = result['factor_id'].map(lambda x: user_dict.get(x, {}).get('impact', ''))
+        result[f'{user}_Performance'] = result['factor_id'].map(lambda x: user_dict.get(x, {}).get('performance', ''))
+        result[f'{user}_Score'] = result['factor_id'].map(lambda x: user_dict.get(x, {}).get('user_score', ''))
+        result[f'{user}_Rank'] = result['factor_id'].map(lambda x: user_dict.get(x, {}).get('user_rank', ''))
+    
+    # Calculate mean scores across all users
+    df_agg = df_scores_raw.groupby('factor_id').agg(
+        Mean_Impact=('impact', 'mean'),
+        Mean_Performance=('performance', 'mean')
+    ).reset_index()
+    
+    df_agg['Mean_Score'] = (0.75 * df_agg['Mean_Impact']) + (0.25 * df_agg['Mean_Performance'].abs())
+    df_agg['Auto_Final_Rank'] = rankdata(-df_agg['Mean_Score'], method='min')
+    
+    # Merge mean scores
+    result = result.merge(df_agg[['factor_id', 'Mean_Score', 'Auto_Final_Rank']], on='factor_id', how='left')
+    
+    # Add admin override ranks
+    override_dict = df_overrides.set_index('factor_id')['override_rank'].to_dict()
+    result['Admin_Final_Rank'] = result['factor_id'].map(override_dict)
+    
+    # Fill NaN in Admin_Final_Rank with Auto_Final_Rank
+    result['Admin_Final_Rank'] = result['Admin_Final_Rank'].fillna(result['Auto_Final_Rank']).astype('Int64')
+    
+    return result
+
+
 # --- ADMIN DASHBOARD ---
 
 def admin_dashboard():
@@ -91,11 +178,12 @@ def admin_dashboard():
 
     st.title("Admin Control Panel")
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📤 Upload Factors",
         "📊 Live Tracking",
         "🎯 PI Matrix & Rankings",
-        "✍️ Resolve Tied Ranks"
+        "✍️ Resolve Tied Ranks",
+        "📥 Download Detailed Report"
     ])
 
     conn = get_db_connection()
@@ -180,12 +268,34 @@ def admin_dashboard():
             df_agg['Performance_Index'] = df_agg['Avg_Performance']
             df_agg['Priority_Score'] = (0.75 * df_agg['Avg_Impact']) + (0.25 * df_agg['Performance_Index'].abs())
 
-            # --- Handle Rank Overrides ---
+            # --- Handle Rank Overrides with ADJUSTED PRIORITY SCORE ---
             overrides_df = conn.query("SELECT factor_id, override_rank FROM rank_overrides", ttl=0)
-            override_map = pd.Series(overrides_df.override_rank.values, index=overrides_df.factor_id).to_dict()
-            df_agg['override_sort_key'] = df_agg['factor_id'].map(override_map).fillna(9999)
+            
+            if not overrides_df.empty:
+                # Create a mapping of override ranks
+                override_map = overrides_df.set_index('factor_id')['override_rank'].to_dict()
+                
+                # For factors with overrides, adjust their priority score to force the desired rank
+                # We'll use a simple formula: higher rank number = lower priority score
+                max_priority = df_agg['Priority_Score'].max()
+                min_priority = df_agg['Priority_Score'].min()
+                
+                def adjust_priority(row):
+                    if row['factor_id'] in override_map:
+                        # Map override rank to priority score range
+                        # Rank 1 should get highest score, Rank N should get lowest
+                        target_rank = override_map[row['factor_id']]
+                        # Create a score that will place it at the target rank
+                        # Use a score slightly above the natural score at that rank position
+                        return max_priority + 10 - (target_rank * 0.1)
+                    return row['Priority_Score']
+                
+                df_agg['Adjusted_Priority_Score'] = df_agg.apply(adjust_priority, axis=1)
+            else:
+                df_agg['Adjusted_Priority_Score'] = df_agg['Priority_Score']
 
-            df_agg = df_agg.sort_values(by=['Priority_Score', 'override_sort_key'], ascending=[False, True])
+            # Sort by adjusted priority score
+            df_agg = df_agg.sort_values(by='Adjusted_Priority_Score', ascending=False).reset_index(drop=True)
             df_agg['Final_Rank'] = range(1, len(df_agg) + 1)
 
             # Display Final Rankings Table
@@ -193,10 +303,15 @@ def admin_dashboard():
             display_cols = {
                 'Final_Rank': 'Rank', 'factor_id': 'Factor ID', 'factor_text': 'Description',
                 'type': 'Type', 'Avg_Impact': 'Avg Impact', 'Performance_Index': 'Perf. Index',
-                'Priority_Score': 'Priority Score'
+                'Priority_Score': 'Original Score', 'Adjusted_Priority_Score': 'Adjusted Score'
             }
             st.dataframe(
-                df_agg[list(display_cols.keys())].rename(columns=display_cols),
+                df_agg[list(display_cols.keys())].rename(columns=display_cols).style.format({
+                    'Avg Impact': '{:.2f}',
+                    'Perf. Index': '{:.2f}',
+                    'Original Score': '{:.3f}',
+                    'Adjusted Score': '{:.3f}'
+                }),
                 use_container_width=True,
                 hide_index=True
             )
@@ -204,33 +319,43 @@ def admin_dashboard():
             # --- Visualization ---
             st.divider()
             st.markdown("### 🎯 Performance-Impact Matrix Visualization")
+            
+            # IMPORTANT: Use Adjusted_Priority_Score to determine vertical position in plot
+            # This ensures manual rank changes move the points vertically to prevent overlaps
             fig = go.Figure()
             fig.add_shape(type="rect", x0=-10, y0=0, x1=0, y1=10, fillcolor="rgba(255, 200, 200, 0.2)", line_width=0, layer="below")
             fig.add_shape(type="rect", x0=0, y0=0, x1=10, y1=10, fillcolor="rgba(200, 255, 200, 0.2)", line_width=0, layer="below")
 
             colors = ['red' if t.lower() == 'weakness' else 'green' for t in df_agg['type']]
 
+            # Use a normalized adjusted score for Y-axis to spread points vertically
+            # Map adjusted scores to 1-9 range for visual clarity
+            score_min = df_agg['Adjusted_Priority_Score'].min()
+            score_max = df_agg['Adjusted_Priority_Score'].max()
+            df_agg['Plot_Y'] = 1 + 8 * (df_agg['Adjusted_Priority_Score'] - score_min) / (score_max - score_min)
+
             fig.add_trace(go.Scatter(
                 x=df_agg['Performance_Index'],
-                y=df_agg['Avg_Impact'],
+                y=df_agg['Plot_Y'],  # Use adjusted Y position
                 mode='markers+text',
                 text=df_agg['factor_id'],
                 textposition="top center",
-                customdata=df_agg[['factor_text', 'type', 'Priority_Score', 'Final_Rank']],
+                customdata=df_agg[['factor_text', 'type', 'Priority_Score', 'Final_Rank', 'Adjusted_Priority_Score']],
                 marker=dict(size=16, color=colors, opacity=0.7),
                 hovertemplate=(
                     "<b>%{text}</b> | Rank: %{customdata[3]:.0f}<br>"
                     "<b>%{customdata[0]}</b><br>"
                     "Type: %{customdata[1]}<br>"
-                    "Impact: %{y:.2f}<br>"
+                    "Avg Impact: %{customdata[2]:.2f}<br>"
                     "Performance: %{x:.2f}<br>"
-                    "Priority: %{customdata[2]:.2f}<extra></extra>"
+                    "Original Priority: %{customdata[2]:.3f}<br>"
+                    "Adjusted Priority: %{customdata[4]:.3f}<extra></extra>"
                 )
             ))
 
             fig.update_layout(
                 xaxis_title="<b>Performance Index</b> (← Weaknesses | Strengths →)",
-                yaxis_title="<b>Average Impact</b> (Low → High)",
+                yaxis_title="<b>Strategic Priority</b> (Low → High)",
                 xaxis=dict(range=[-10, 10], zeroline=True, zerolinewidth=3, zerolinecolor='black'),
                 yaxis=dict(range=[0, 10], zeroline=True, zerolinewidth=1, zerolinecolor='gray'),
                 height=600,
@@ -245,6 +370,8 @@ def admin_dashboard():
     # Tab 4: Resolve Tied Ranks
     with tab4:
         st.header("Resolve Tied Rankings")
+        st.info("Manually adjust the final rank of any factor. This will change its position on the PI Matrix to prevent overlaps.")
+        
         df_scores_query_tab4 = """
             SELECT s.factor_id, f.factor_text, f.type, s.impact, s.performance 
             FROM scores s JOIN factors f ON s.factor_id = f.factor_id
@@ -258,46 +385,119 @@ def admin_dashboard():
             ).reset_index()
             df_agg_tab4['Performance_Index'] = df_agg_tab4['Avg_Performance']
             df_agg_tab4['Priority_Score'] = (0.75 * df_agg_tab4['Avg_Impact']) + (0.25 * df_agg_tab4['Performance_Index'].abs())
-            df_agg_tab4['Initial_Rank'] = rankdata(-df_agg_tab4['Priority_Score'], method='min')
+            df_agg_tab4['Auto_Rank'] = rankdata(-df_agg_tab4['Priority_Score'], method='min')
+            df_agg_tab4 = df_agg_tab4.sort_values('Auto_Rank')
 
-            tied_scores = df_agg_tab4[df_agg_tab4.duplicated(subset=['Priority_Score'], keep=False)].sort_values('Priority_Score', ascending=False)
+            # Get existing overrides
+            existing_overrides = conn.query("SELECT factor_id, override_rank FROM rank_overrides", ttl=0)
+            override_dict = existing_overrides.set_index('factor_id')['override_rank'].to_dict()
 
-            if not tied_scores.empty:
-                st.warning("Tied ranks detected! Please set a manual priority for the factors below.")
-                st.dataframe(
-                    tied_scores[['Initial_Rank', 'factor_id', 'factor_text', 'Priority_Score']],
-                    use_container_width=True,
-                    hide_index=True
-                )
+            st.markdown("### Current Rankings")
+            st.dataframe(
+                df_agg_tab4[['Auto_Rank', 'factor_id', 'factor_text', 'Priority_Score']].rename(columns={
+                    'Auto_Rank': 'Current Rank', 'factor_id': 'Factor ID',
+                    'factor_text': 'Description', 'Priority_Score': 'Priority Score'
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
 
-                with st.form("override_form"):
-                    overrides = {}
-                    for _, row in tied_scores.iterrows():
+            st.markdown("### Adjust Rankings Manually")
+            st.warning("Set a manual rank for any factor. Lower rank number = Higher priority.")
+
+            with st.form("override_form_all"):
+                overrides = {}
+                
+                # Display all factors with option to override
+                for _, row in df_agg_tab4.iterrows():
+                    current_override = override_dict.get(row['factor_id'])
+                    default_val = current_override if current_override else int(row['Auto_Rank'])
+                    
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.write(f"**{row['factor_id']}**: {row['factor_text']}")
+                    with col2:
                         overrides[row['factor_id']] = st.number_input(
-                            f"Set manual rank for {row['factor_id']} ({row['factor_text']})",
-                            min_value=1, max_value=len(df_agg_tab4), step=1, value=int(row['Initial_Rank'])
+                            f"Rank for {row['factor_id']}",
+                            min_value=1,
+                            max_value=len(df_agg_tab4),
+                            step=1,
+                            value=default_val,
+                            key=f"override_{row['factor_id']}",
+                            label_visibility="collapsed"
                         )
 
-                    if st.form_submit_button("Save Overrides"):
-                        try:
-                            with conn.session as s:
-                                for factor_id, rank in overrides.items():
-                                    s.execute(text("""
-                                        INSERT INTO rank_overrides (factor_id, override_rank)
-                                        VALUES (:fid, :rank)
-                                        ON CONFLICT (factor_id)
-                                        DO UPDATE SET override_rank = EXCLUDED.override_rank;
-                                    """), {'fid': factor_id, 'rank': rank})
-                                s.commit()
-                            st.cache_data.clear()
-                            st.success("Overrides saved! The PI Matrix tab has been updated.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Database error while saving overrides: {e}")
-            else:
-                st.success("No tied ranks detected.")
+                col_submit, col_clear = st.columns(2)
+                with col_submit:
+                    submit_overrides = st.form_submit_button("💾 Save All Rank Overrides", use_container_width=True)
+                with col_clear:
+                    clear_overrides = st.form_submit_button("🗑️ Clear All Overrides", use_container_width=True)
+
+                if submit_overrides:
+                    try:
+                        with conn.session as s:
+                            # Clear existing overrides first
+                            s.execute(text("DELETE FROM rank_overrides;"))
+                            # Insert all new overrides
+                            for factor_id, rank in overrides.items():
+                                s.execute(text("""
+                                    INSERT INTO rank_overrides (factor_id, override_rank)
+                                    VALUES (:fid, :rank)
+                                """), {'fid': factor_id, 'rank': rank})
+                            s.commit()
+                        st.cache_data.clear()
+                        st.success("All rank overrides saved! The PI Matrix has been updated. Go to the 'PI Matrix & Rankings' tab to see changes.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Database error while saving overrides: {e}")
+
+                if clear_overrides:
+                    try:
+                        with conn.session as s:
+                            s.execute(text("DELETE FROM rank_overrides;"))
+                            s.commit()
+                        st.cache_data.clear()
+                        st.success("All overrides cleared! Rankings restored to automatic calculation.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Database error while clearing overrides: {e}")
+
         else:
-            st.info("No scores available to check for ties.")
+            st.info("No scores available to manage rankings.")
+
+    # Tab 5: Download Detailed Report
+    with tab5:
+        st.header("📥 Download Detailed Scoring Report")
+        st.info("This comprehensive report includes individual user scores, rankings, mean calculations, and final rankings.")
+
+        if st.button("Generate CSV Report", key="generate_csv"):
+            with st.spinner("Building detailed report..."):
+                try:
+                    detailed_csv = build_detailed_csv(conn)
+                    
+                    if detailed_csv is not None:
+                        # Convert to CSV
+                        csv_buffer = io.StringIO()
+                        detailed_csv.to_csv(csv_buffer, index=False)
+                        csv_data = csv_buffer.getvalue()
+
+                        st.success("Report generated successfully!")
+                        st.download_button(
+                            label="📥 Download CSV Report",
+                            data=csv_data,
+                            file_name="PI_Analysis_Detailed_Report.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+
+                        # Show preview
+                        st.markdown("### Preview (first 10 rows)")
+                        st.dataframe(detailed_csv.head(10), use_container_width=True)
+                    else:
+                        st.warning("No data available yet. Users must submit their scores first.")
+                        
+                except Exception as e:
+                    st.error(f"Error generating report: {e}")
 
 
 # --- USER DASHBOARD ---
