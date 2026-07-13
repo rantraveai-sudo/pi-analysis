@@ -219,6 +219,69 @@ def admin_dashboard():
                             st.error(f"Database error while saving factors: {e}")
             except Exception as e:
                 st.error(f"An error occurred while reading the Excel file: {e}")
+        st.divider()
+        st.header("🔄 Load Scores from Backup CSV")
+        st.info("Upload a previously exported detailed report CSV to restore user scores. This will overwrite existing scores for users in the CSV.")
+        
+        backup_file = st.file_uploader("Choose a backup CSV file", type="csv", key="backup_csv")
+        
+        if backup_file:
+            try:
+                df_backup = pd.read_csv(backup_file)
+                
+                # Validate the CSV has the expected structure
+                required_cols = ['factor_id']
+                if not all(col in df_backup.columns or col.lower() in df_backup.columns for col in required_cols):
+                    st.error("Invalid CSV format. Must contain 'factor_id' column and user score columns.")
+                else:
+                    st.write("Preview of Backup Data:")
+                    st.dataframe(df_backup.head(10), use_container_width=True)
+                    
+                    # Extract user columns (format: username_Impact, username_Performance)
+                    user_cols = [col for col in df_backup.columns if '_Impact' in col or '_Performance' in col]
+                    users_found = list(set([col.split('_')[0] for col in user_cols]))
+                    
+                    st.write(f"**Found {len(users_found)} users in backup:** {', '.join(users_found)}")
+                    
+                    if st.button("📥 Load Scores from CSV", key="load_backup"):
+                        with st.spinner("Loading scores from backup..."):
+                            try:
+                                with conn.session as s:
+                                    loaded_count = 0
+                                    
+                                    for username in users_found:
+                                        impact_col = f"{username}_Impact"
+                                        perf_col = f"{username}_Performance"
+                                        
+                                        if impact_col in df_backup.columns and perf_col in df_backup.columns:
+                                            for _, row in df_backup.iterrows():
+                                                factor_id = row['factor_id']
+                                                impact_val = row[impact_col]
+                                                perf_val = row[perf_col]
+                                                
+                                                # Skip rows with missing data
+                                                if pd.notna(impact_val) and pd.notna(perf_val):
+                                                    s.execute(text("""
+                                                        INSERT INTO scores (username, factor_id, impact, performance)
+                                                        VALUES (:user, :fid, :imp, :perf)
+                                                        ON CONFLICT (username, factor_id)
+                                                        DO UPDATE SET impact = EXCLUDED.impact, performance = EXCLUDED.performance;
+                                                    """), {
+                                                        'user': username,
+                                                        'fid': factor_id,
+                                                        'imp': float(impact_val),
+                                                        'perf': float(perf_val)
+                                                    })
+                                                    loaded_count += 1
+                                    
+                                    s.commit()
+                                st.cache_data.clear()
+                                st.success(f"✅ Successfully loaded {loaded_count} score records from backup CSV!")
+                                st.balloons()
+                            except Exception as e:
+                                st.error(f"Error loading backup data: {e}")
+            except Exception as e:
+                st.error(f"Error reading CSV file: {e}")
 
     # Tab 2: Live Tracking
     with tab2:
